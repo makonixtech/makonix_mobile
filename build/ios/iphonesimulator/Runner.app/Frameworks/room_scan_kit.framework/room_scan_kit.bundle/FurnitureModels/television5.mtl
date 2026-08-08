@@ -1,0 +1,7 @@
+# UyDosh television5 — flat black panel (Apple RoomPlan-style placeholder)
+# Near-black metal so the color UI stays hidden (metal is never recolored).
+
+newmtl metalDark
+Ka 0.000000 0.000000 0.000000
+Kd 0.035000 0.035000 0.035000
+Ks 0.450000 0.450000 0.450000

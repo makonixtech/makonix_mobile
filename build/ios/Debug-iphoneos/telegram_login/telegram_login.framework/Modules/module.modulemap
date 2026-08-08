@@ -1,0 +1,11 @@
+framework module telegram_login {
+  umbrella header "telegram_login-umbrella.h"
+
+  export *
+  module * { export * }
+}
+
+module telegram_login.Swift {
+  header "telegram_login-Swift.h"
+  requires objc
+}

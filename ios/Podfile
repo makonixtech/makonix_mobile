@@ -1,0 +1,1357 @@
+# Makon 3D — iOS Podfile.
+#
+# The post_install section patches the flutter_roomplan pod the same way the
+# UyDosh app does (markers kept as "uydosh:" so the patches stay byte-identical
+# and easy to diff against the original):
+#   - scene-safe view-controller lookups (UIScene apps)
+#   - notify Flutter on cancel / empty finish
+#   - localized + Flutter-provided button titles, nicer styling
+#   - compass orientation sidecar written next to the exported USDZ
+#   - keep the screen awake during capture
+#   - live detection feed + stats HUD (RoomScanLiveDetectionOverlay from kit)
+#   - real-time ARMesh scan-quality heatmap (RoomScanQualityHeatmap from kit)
+#   - photogrammetry Phase 1 keyframes + scan package
+platform :ios, '17.0'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_ios_podfile_setup
+
+# Shared RoomPlan helpers live in room_scan_kit. flutter_roomplan's patched
+# RoomCaptureViewController still needs them in the same module (Classes/**).
+# Copy before CocoaPods indexes source_files so CI clean checkouts compile.
+def ensure_roomplan_kit_helper!(filename)
+  roomplan_classes = File.expand_path('.symlinks/plugins/flutter_roomplan/ios/Classes', __dir__)
+  return nil unless Dir.exist?(roomplan_classes)
+
+  dst = File.join(roomplan_classes, filename)
+  # Prefer room_scan_kit (symlink / sibling) over a stale Runner/ copy.
+  candidates = [
+    File.expand_path(
+      ".symlinks/plugins/room_scan_kit/ios/room_scan_kit/Sources/room_scan_kit/#{filename}",
+      __dir__
+    ),
+    # Local path override (pubspec_overrides.yaml) — sibling checkout.
+    File.expand_path(
+      "../../room_scan_kit/ios/room_scan_kit/Sources/room_scan_kit/#{filename}",
+      __dir__
+    ),
+    File.expand_path("Runner/#{filename}", __dir__),
+  ]
+  src = candidates.find { |path| File.exist?(path) }
+  if src.nil?
+    raise "#{filename} not found (tried: #{candidates.join(', ')})"
+  end
+
+  FileUtils.cp(src, dst)
+  Pod::UI.puts "Synced #{filename} into flutter_roomplan from #{src}"
+  dst
+end
+
+def ensure_roomplan_orientation_capture!
+  ensure_roomplan_kit_helper!('RoomScanOrientationCapture.swift')
+end
+
+def ensure_roomplan_live_detection_overlay!
+  ensure_roomplan_kit_helper!('RoomScanLiveDetectionOverlay.swift')
+end
+
+def ensure_roomplan_quality_heatmap!
+  ensure_roomplan_kit_helper!('RoomScanQualityHeatmap.swift')
+end
+
+def ensure_roomplan_photogrammetry_capture!
+  ensure_roomplan_kit_helper!('PhotogrammetryCapture.swift')
+end
+
+def ensure_roomplan_results_overlay!
+  ensure_roomplan_kit_helper!('RoomScanResultsOverlay.swift')
+end
+
+ensure_roomplan_orientation_capture!
+ensure_roomplan_live_detection_overlay!
+ensure_roomplan_quality_heatmap!
+ensure_roomplan_photogrammetry_capture!
+ensure_roomplan_results_overlay!
+
+target 'Runner' do
+  use_frameworks!
+
+  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_ios_build_settings(target)
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '17.0'
+
+      # permission_handler: opt in to the permission types we actually use.
+      # The pod ships every permission's Swift code, gated behind these
+      # preprocessor macros. Without them, Permission.camera returns .denied
+      # with no system prompt. Location is used by the scan-time heading
+      # reader (true-north compass on the floor plan).
+      config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= ['$(inherited)']
+      config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] += [
+        'PERMISSION_CAMERA=1',
+        'PERMISSION_LOCATION=1',
+      ]
+    end
+  end
+
+  # Patch flutter_roomplan iOS plugin to work with iOS multi-scene apps.
+  # The upstream plugin uses `UIApplication.shared.delegate?.window??.rootViewController`,
+  # which is often nil on iOS 13+ (UIScene) and causes "Start scan" to no-op and
+  # USDZ path lookups to fail.
+  plugin_file = File.expand_path(File.join(__dir__, '.symlinks', 'plugins', 'flutter_roomplan', 'ios', 'Classes', 'FlutterRoomplanPlugin.swift'))
+  if File.exist?(plugin_file)
+    src = File.read(plugin_file)
+    marker = '/* uydosh: scene-safe VC lookup */'
+    unless src.include?(marker)
+      # Replace fragile rootVC lookup.
+      src = src.gsub(
+        'let rootVC = UIApplication.shared.delegate?.window??.rootViewController',
+        'let rootVC = FlutterRoomplanPlugin.uydoshTopViewController()'
+      )
+      # Replace scan VC lookup used by getUsdzFilePath/getJsonFilePath.
+      src = src.gsub(
+        'if let roomVC = UIApplication.shared.delegate?.window??.rootViewController?.presentedViewController as? RoomCaptureViewController',
+        'if let roomVC = FlutterRoomplanPlugin.uydoshCurrentRoomCaptureViewController()'
+      )
+
+      # Inject helpers before the final closing brace of the class.
+      injection = <<~SWIFT
+
+        #{marker}
+        private static func uydoshTopViewController() -> UIViewController? {
+          for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            let windows = windowScene.windows
+            let root = windows.first(where: { $0.isKeyWindow })?.rootViewController
+              ?? windows.first?.rootViewController
+            if let root = root {
+              return uydoshFindTop(from: root)
+            }
+          }
+          return nil
+        }
+
+        private static func uydoshFindTop(from vc: UIViewController) -> UIViewController {
+          if let presented = vc.presentedViewController {
+            return uydoshFindTop(from: presented)
+          }
+          if let nav = vc as? UINavigationController, let visible = nav.visibleViewController {
+            return uydoshFindTop(from: visible)
+          }
+          if let tab = vc as? UITabBarController, let selected = tab.selectedViewController {
+            return uydoshFindTop(from: selected)
+          }
+          return vc
+        }
+
+        private static func uydoshCurrentRoomCaptureViewController() -> RoomCaptureViewController? {
+          guard let top = uydoshTopViewController() else { return nil }
+          // Walk presented chain from the current top VC.
+          var vc: UIViewController? = top
+          while let current = vc {
+            if let room = current as? RoomCaptureViewController { return room }
+            vc = current.presentedViewController
+          }
+          return nil
+        }
+      SWIFT
+
+      # Insert right before the last "}" (end of class).
+      idx = src.rindex("}")
+      if idx
+        src = src.dup.insert(idx, injection)
+        File.write(plugin_file, src)
+      end
+    end
+  end
+
+  # Same UIScene issue as above: finishAndReturnResult() notifies Flutter via
+  # `UIApplication.shared.delegate?.window??.rootViewController`, which is nil
+  # on scene-based apps — so `onRoomCaptureFinished` never reaches Dart, the
+  # USDZ upload never runs, and the user stays on the scan screen after scan.
+  room_capture_file = File.expand_path(File.join(__dir__, '.symlinks', 'plugins', 'flutter_roomplan', 'ios', 'Classes', 'RoomCaptureViewController.swift'))
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: room capture finished → Flutter (UIScene-safe) */'
+    unless src.include?(marker)
+      src = src.gsub(
+        "                        if let controller = UIApplication.shared.delegate?.window??.rootViewController as? FlutterViewController {\n                            let channel = FlutterMethodChannel(name: \"rkg/flutter_roomplan\", binaryMessenger: controller.binaryMessenger)\n                            channel.invokeMethod(\"onRoomCaptureFinished\", arguments: nil)\n                        }",
+        '                        self.uydoshNotifyRoomCaptureFinishedToFlutter()'
+      )
+
+      # Use explicit lines (not <<~SWIFT) so Ruby does not strip Swift indentation.
+      injection = [
+        '',
+        "    #{marker}",
+        '    private func uydoshNotifyRoomCaptureFinishedToFlutter() {',
+        '        var vc: UIViewController? = self.presentingViewController',
+        '        while let current = vc {',
+        '            if let flutter = current as? FlutterViewController {',
+        '                let channel = FlutterMethodChannel(name: "rkg/flutter_roomplan", binaryMessenger: flutter.binaryMessenger)',
+        '                channel.invokeMethod("onRoomCaptureFinished", arguments: nil)',
+        '                return',
+        '            }',
+        '            if let nav = current as? UINavigationController {',
+        '                for sub in nav.viewControllers {',
+        '                    if let flutter = sub as? FlutterViewController {',
+        '                        let channel = FlutterMethodChannel(name: "rkg/flutter_roomplan", binaryMessenger: flutter.binaryMessenger)',
+        '                        channel.invokeMethod("onRoomCaptureFinished", arguments: nil)',
+        '                        return',
+        '                    }',
+        '                }',
+        '                if let flutter = nav.visibleViewController as? FlutterViewController {',
+        '                    let channel = FlutterMethodChannel(name: "rkg/flutter_roomplan", binaryMessenger: flutter.binaryMessenger)',
+        '                    channel.invokeMethod("onRoomCaptureFinished", arguments: nil)',
+        '                    return',
+        '                }',
+        '            }',
+        '            if let tab = current as? UITabBarController {',
+        '                vc = tab.selectedViewController',
+        '                continue',
+        '            }',
+        '            vc = current.presentingViewController',
+        '        }',
+        '        for scene in UIApplication.shared.connectedScenes {',
+        '            guard let windowScene = scene as? UIWindowScene else { continue }',
+        '            let root = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController',
+        '                ?? windowScene.windows.first?.rootViewController',
+        '            guard let root = root else { continue }',
+        '            if let flutter = Self.uydoshFindFlutterViewController(in: root) {',
+        '                let channel = FlutterMethodChannel(name: "rkg/flutter_roomplan", binaryMessenger: flutter.binaryMessenger)',
+        '                channel.invokeMethod("onRoomCaptureFinished", arguments: nil)',
+        '                return',
+        '            }',
+        '        }',
+        '    }',
+        '',
+        '    private static func uydoshFindFlutterViewController(in vc: UIViewController) -> FlutterViewController? {',
+        '        if let f = vc as? FlutterViewController { return f }',
+        '        if let nav = vc as? UINavigationController {',
+        '            for child in nav.viewControllers {',
+        '                if let found = uydoshFindFlutterViewController(in: child) { return found }',
+        '            }',
+        '        }',
+        '        if let tab = vc as? UITabBarController, let selected = tab.selectedViewController {',
+        '            return uydoshFindFlutterViewController(in: selected)',
+        '        }',
+        '        for child in vc.children {',
+        '            if let found = uydoshFindFlutterViewController(in: child) { return found }',
+        '        }',
+        '        return nil',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    private func resetScanningSession() {',
+        "#{injection}\n    private func resetScanningSession() {"
+      )
+      File.write(room_capture_file, src)
+    end
+    unless src.include?('name: "room_scan_kit/photogrammetry"')
+      src = src.sub(
+        '                self.uydoshPhotogrammetryPackageReady?(package.archiveURL)',
+        [
+          '                self.uydoshPhotogrammetryPackageReady?(package.archiveURL)',
+          '                if let root = self.view.window?.rootViewController,',
+          '                   let flutter = Self.uydoshFindFlutterViewController(in: root) {',
+          '                    FlutterMethodChannel(',
+          '                        name: "room_scan_kit/photogrammetry",',
+          '                        binaryMessenger: flutter.binaryMessenger',
+          '                    ).invokeMethod("onPackageReady", arguments: package.archiveURL.path)',
+          '                }',
+        ].join("\n")
+      )
+      File.write(room_capture_file, src)
+    end
+    custom_session_marker = '/* uydosh: shared scene-reconstruction ARSession */'
+    heatmap_mesh_marker = '/* uydosh: mesh always for heatmap */'
+    unless src.include?(custom_session_marker)
+      src = src.sub(
+        '    private var roomCaptureView: RoomCaptureView!',
+        "    private var roomCaptureView: RoomCaptureView!\n    #{custom_session_marker}\n    private let uydoshSceneReconstructionSession = ARSession()"
+      )
+      src = src.sub(
+        '        roomCaptureView = RoomCaptureView(frame: .zero)',
+        [
+          "        #{custom_session_marker}",
+          '        let worldConfiguration = ARWorldTrackingConfiguration()',
+          '        worldConfiguration.planeDetection = [.horizontal, .vertical]',
+          "        #{heatmap_mesh_marker}",
+          '        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {',
+          '            worldConfiguration.sceneReconstruction = .meshWithClassification',
+          '        } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {',
+          '            worldConfiguration.sceneReconstruction = .mesh',
+          '        }',
+          '        var semantics: ARConfiguration.FrameSemantics = []',
+          '        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {',
+          '            semantics.insert(.sceneDepth)',
+          '        }',
+          '        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {',
+          '            semantics.insert(.smoothedSceneDepth)',
+          '        }',
+          '        worldConfiguration.frameSemantics = semantics',
+          '        uydoshSceneReconstructionSession.run(worldConfiguration)',
+          '        print("[RoomScan] shared ARSession started sceneReconstruction=\\(worldConfiguration.sceneReconstruction.rawValue)")',
+          '        roomCaptureView = RoomCaptureView(',
+          '            frame: .zero,',
+          '            arSession: uydoshSceneReconstructionSession',
+          '        )',
+        ].join("\n")
+      )
+      File.write(room_capture_file, src)
+    end
+    # Existing installs gated mesh behind photogrammetry — ungating gives the
+    # dense ARMeshAnchor heatmap without requiring the photo toggle.
+    if src.include?(custom_session_marker) && !src.include?(heatmap_mesh_marker)
+      gated = [
+        '        if uydoshPhotogrammetryEnabled {',
+        '        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {',
+        '            worldConfiguration.sceneReconstruction = .meshWithClassification',
+        '        } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {',
+        '            worldConfiguration.sceneReconstruction = .mesh',
+        '        }',
+        '        var semantics: ARConfiguration.FrameSemantics = []',
+        '        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {',
+        '            semantics.insert(.sceneDepth)',
+        '        }',
+        '        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {',
+        '            semantics.insert(.smoothedSceneDepth)',
+        '        }',
+        '        worldConfiguration.frameSemantics = semantics',
+        '        }',
+      ].join("\n")
+      ungated = [
+        "        #{heatmap_mesh_marker}",
+        '        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {',
+        '            worldConfiguration.sceneReconstruction = .meshWithClassification',
+        '        } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {',
+        '            worldConfiguration.sceneReconstruction = .mesh',
+        '        }',
+        '        var semantics: ARConfiguration.FrameSemantics = []',
+        '        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {',
+        '            semantics.insert(.sceneDepth)',
+        '        }',
+        '        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {',
+        '            semantics.insert(.smoothedSceneDepth)',
+        '        }',
+        '        worldConfiguration.frameSemantics = semantics',
+      ].join("\n")
+      if src.include?(gated)
+        src = src.sub(gated, ungated)
+        src = src.sub(
+          'print("[Photogrammetry] shared ARSession started sceneReconstruction=',
+          'print("[RoomScan] shared ARSession started sceneReconstruction='
+        )
+        File.write(room_capture_file, src)
+      end
+    end
+  end
+
+  # Notify Flutter when the user dismisses the native RoomCaptureViewController
+  # without exporting a USDZ — i.e. tapped "Cancel", or tapped "Done" → "Finish"
+  # before any room was captured. Upstream just calls `self.dismiss(animated:)`
+  # in those paths and never sends `onRoomCaptureFinished`, so Dart's listener
+  # never fires and our screen is stuck on "Start scan" with no feedback.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: notify flutter on cancel/empty-finish */'
+    unless src.include?(marker)
+      src = src.sub(
+        "    @objc private func cancelScanning() {\n        self.dismiss(animated: true)\n    }",
+        "    @objc private func cancelScanning() {\n        #{marker}\n        self.uydoshNotifyRoomCaptureFinishedToFlutter()\n        self.dismiss(animated: true)\n    }"
+      )
+      # finishAndReturnResult's "no captured room" early-out also dismisses
+      # silently — make it behave the same as cancel.
+      src = src.sub(
+        "    @objc private func finishAndReturnResult() {\n        guard let currentCapturedRoom = currentCapturedRoom else {\n            self.dismiss(animated: true)\n            return\n        }",
+        "    @objc private func finishAndReturnResult() {\n        guard let currentCapturedRoom = currentCapturedRoom else {\n            #{marker}\n            self.uydoshNotifyRoomCaptureFinishedToFlutter()\n            self.dismiss(animated: true)\n            return\n        }"
+      )
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Localize hardcoded UI strings in flutter_roomplan's RoomCaptureViewController.
+  # Upstream uses hardcoded English titles for top buttons.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: localize roomplan buttons */'
+    unless src.include?(marker)
+      # Inject helper + swap hardcoded titles.
+      # Keep the code simple: strings resolved from Runner's Localizable.strings.
+      helper = [
+        '',
+        "    #{marker}",
+        '    private func uydoshL(_ key: String, _ fallback: String) -> String {',
+        '        NSLocalizedString(key, tableName: nil, bundle: Bundle.main, value: fallback, comment: "")',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    private func setupUI() {',
+        "#{helper}\n    private func setupUI() {"
+      )
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Always ensure RoomCaptureViewController can accept Flutter-provided button titles
+  # (even if the localization patch above already ran in a previous install).
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: roomplan button overrides */'
+    unless src.include?(marker)
+      # Add override properties right after jsonFilePath.
+      unless src.include?('public var uydoshCancelTitle')
+        src = src.sub(
+          '    public  var jsonFilePath: String?',
+          "    public  var jsonFilePath: String?\n\n    #{marker}\n    public var uydoshCancelTitle: String?\n    public var uydoshDoneTitle: String?\n    public var uydoshFinishTitle: String?\n    public var uydoshScanOtherRoomsTitle: String?"
+        )
+      end
+
+      # Replace the setTitle calls with "override if provided" versions (idempotent-ish).
+      src = src.gsub(
+        'finishButton.setTitle(uydoshL("roomplan_finish", "Finish"), for: .normal)',
+        'finishButton.setTitle((uydoshFinishTitle?.isEmpty == false ? uydoshFinishTitle! : uydoshL("roomplan_finish", "Finish")), for: .normal)'
+      )
+      src = src.gsub(
+        'scanOtherRoomsButton.setTitle(uydoshL("roomplan_scan_other_rooms", "Scan Other Rooms"), for: .normal)',
+        'scanOtherRoomsButton.setTitle((uydoshScanOtherRoomsTitle?.isEmpty == false ? uydoshScanOtherRoomsTitle! : uydoshL("roomplan_scan_other_rooms", "Scan Other Rooms")), for: .normal)'
+      )
+      src = src.gsub(
+        'cancelButton.setTitle(uydoshL("roomplan_cancel", "Cancel"), for: .normal)',
+        'cancelButton.setTitle((uydoshCancelTitle?.isEmpty == false ? uydoshCancelTitle! : uydoshL("roomplan_cancel", "Cancel")), for: .normal)'
+      )
+      src = src.gsub(
+        'doneButton.setTitle(uydoshL("roomplan_done", "Done"), for: .normal)',
+        'doneButton.setTitle((uydoshDoneTitle?.isEmpty == false ? uydoshDoneTitle! : uydoshL("roomplan_done", "Done")), for: .normal)'
+      )
+
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Restyle the "Finish" / "Scan Other Rooms" buttons to look like a matched pair of
+  # pill-shaped buttons instead of the upstream mismatched rectangle sizes (120x44 vs
+  # 160x44).
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: nicer roomplan button styling */'
+    unless src.include?(marker)
+      src = src.sub(
+        "        // Configure Finish Button - Filled style\n" \
+        "        finishButton.setTitle((uydoshFinishTitle?.isEmpty == false ? uydoshFinishTitle! : uydoshL(\"roomplan_finish\", \"Finish\")), for: .normal)",
+        "        // Configure Finish Button - Filled style\n" \
+        "        #{marker}\n" \
+        "        finishButton.setTitle((uydoshFinishTitle?.isEmpty == false ? uydoshFinishTitle! : uydoshL(\"roomplan_finish\", \"Finish\")), for: .normal)"
+      )
+
+      src = src.sub(
+        "        finishButton.layer.cornerRadius = 12\n" \
+        "        finishButton.addTarget(self, action: #selector(finishAndReturnResult), for: .touchUpInside)",
+        "        finishButton.layer.cornerRadius = 24\n" \
+        "        finishButton.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .semibold)\n" \
+        "        finishButton.layer.shadowColor = UIColor.black.cgColor\n" \
+        "        finishButton.layer.shadowOpacity = 0.25\n" \
+        "        finishButton.layer.shadowRadius = 6\n" \
+        "        finishButton.layer.shadowOffset = CGSize(width: 0, height: 3)\n" \
+        "        finishButton.addTarget(self, action: #selector(finishAndReturnResult), for: .touchUpInside)"
+      )
+
+      src = src.sub(
+        "        scanOtherRoomsButton.backgroundColor = UIColor.clear\n" \
+        "        scanOtherRoomsButton.setTitleColor(UIColor(red: 75/255.0, green: 58/255.0, blue: 47/255.0, alpha: 1.0), for: .normal)\n" \
+        "        scanOtherRoomsButton.layer.cornerRadius = 12\n" \
+        "        scanOtherRoomsButton.layer.borderWidth = 2.0\n" \
+        "        scanOtherRoomsButton.layer.borderColor = UIColor(red: 75/255.0, green: 58/255.0, blue: 47/255.0, alpha: 1.0).cgColor",
+        "        scanOtherRoomsButton.backgroundColor = UIColor(red: 75/255.0, green: 58/255.0, blue: 47/255.0, alpha: 0.08)\n" \
+        "        scanOtherRoomsButton.setTitleColor(UIColor(red: 75/255.0, green: 58/255.0, blue: 47/255.0, alpha: 1.0), for: .normal)\n" \
+        "        scanOtherRoomsButton.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .semibold)\n" \
+        "        scanOtherRoomsButton.layer.cornerRadius = 24\n" \
+        "        scanOtherRoomsButton.layer.borderWidth = 1.5\n" \
+        "        scanOtherRoomsButton.layer.borderColor = UIColor(red: 75/255.0, green: 58/255.0, blue: 47/255.0, alpha: 1.0).cgColor"
+      )
+
+      # Make the two buttons an equal-width pair (was 120x44 / 160x44 — lopsided).
+      src = src.sub(
+        "                finishButton.trailingAnchor.constraint(equalTo: view.centerXAnchor, constant: -10),\n" \
+        "                finishButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40),\n" \
+        "                finishButton.widthAnchor.constraint(equalToConstant: 120),\n" \
+        "                finishButton.heightAnchor.constraint(equalToConstant: 44),\n" \
+        "\n" \
+        "                scanOtherRoomsButton.leadingAnchor.constraint(equalTo: view.centerXAnchor, constant: 10),\n" \
+        "                scanOtherRoomsButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40),\n" \
+        "                scanOtherRoomsButton.widthAnchor.constraint(equalToConstant: 160),\n" \
+        "                scanOtherRoomsButton.heightAnchor.constraint(equalToConstant: 44),",
+        "                finishButton.trailingAnchor.constraint(equalTo: view.centerXAnchor, constant: -8),\n" \
+        "                finishButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40),\n" \
+        "                finishButton.widthAnchor.constraint(equalToConstant: 140),\n" \
+        "                finishButton.heightAnchor.constraint(equalToConstant: 48),\n" \
+        "\n" \
+        "                scanOtherRoomsButton.leadingAnchor.constraint(equalTo: view.centerXAnchor, constant: 8),\n" \
+        "                scanOtherRoomsButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40),\n" \
+        "                scanOtherRoomsButton.widthAnchor.constraint(equalToConstant: 140),\n" \
+        "                scanOtherRoomsButton.heightAnchor.constraint(equalToConstant: 48),"
+      )
+
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Allow passing button titles from Flutter to the RoomCaptureViewController instance.
+  flutter_roomplan_plugin_file = File.expand_path(File.join(__dir__, '.symlinks', 'plugins', 'flutter_roomplan', 'ios', 'Classes', 'FlutterRoomplanPlugin.swift'))
+  if File.exist?(flutter_roomplan_plugin_file)
+    src = File.read(flutter_roomplan_plugin_file)
+    marker = '/* uydosh: pass strings into RoomCaptureViewController */'
+    unless src.include?(marker)
+      # Inject right after roomVC is created.
+      src = src.gsub(
+        '        let roomVC = RoomCaptureViewController()',
+        "        let roomVC = RoomCaptureViewController()\n        #{marker}\n        if let stringsDict = arguments?[\"strings\"] as? [String: Any] {\n            roomVC.uydoshCancelTitle = stringsDict[\"cancel\"] as? String\n            roomVC.uydoshDoneTitle = stringsDict[\"done\"] as? String\n            roomVC.uydoshFinishTitle = stringsDict[\"finish\"] as? String\n            roomVC.uydoshScanOtherRoomsTitle = stringsDict[\"scanOtherRooms\"] as? String\n        }"
+      )
+      File.write(flutter_roomplan_plugin_file, src)
+    end
+  end
+
+  # Pass detection/stats HUD string overrides from Flutter into the capture VC.
+  if File.exist?(flutter_roomplan_plugin_file)
+    src = File.read(flutter_roomplan_plugin_file)
+    marker = '/* uydosh: pass live detection strings */'
+    unless src.include?(marker)
+      injection = [
+        '            /* uydosh: pass live detection strings */',
+        '            var liveOverrides: [String: String] = [:]',
+        '            for (key, value) in stringsDict {',
+        '                if let s = value as? String { liveOverrides[key] = s }',
+        '            }',
+        '            roomVC.uydoshLiveDetectionStringOverrides = liveOverrides',
+      ].join("\n")
+      src = src.sub(
+        '            roomVC.uydoshScanOtherRoomsTitle = stringsDict["scanOtherRooms"] as? String',
+        "            roomVC.uydoshScanOtherRoomsTitle = stringsDict[\"scanOtherRooms\"] as? String\n#{injection}"
+      )
+      File.write(flutter_roomplan_plugin_file, src)
+    end
+  end
+
+  # Re-apply button titles when the capture UI appears so Flutter-provided labels
+  # are always shown even if view setup order changes across iOS versions.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: re-apply button titles on appear */'
+    unless src.include?(marker)
+      helper = [
+        '',
+        "    #{marker}",
+        '    private func uydoshApplyButtonTitles() {',
+        '        finishButton.setTitle((uydoshFinishTitle?.isEmpty == false ? uydoshFinishTitle! : uydoshL("roomplan_finish", "Finish")), for: .normal)',
+        '        scanOtherRoomsButton.setTitle((uydoshScanOtherRoomsTitle?.isEmpty == false ? uydoshScanOtherRoomsTitle! : uydoshL("roomplan_scan_other_rooms", "Scan Other Rooms")), for: .normal)',
+        '        cancelButton.setTitle((uydoshCancelTitle?.isEmpty == false ? uydoshCancelTitle! : uydoshL("roomplan_cancel", "Cancel")), for: .normal)',
+        '        doneButton.setTitle((uydoshDoneTitle?.isEmpty == false ? uydoshDoneTitle! : uydoshL("roomplan_done", "Done")), for: .normal)',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    public override func viewDidAppear(_ animated: Bool) {',
+        "#{helper}\n    public override func viewDidAppear(_ animated: Bool) {"
+      )
+      src = src.sub(
+        "    public override func viewDidAppear(_ animated: Bool) {\n        super.viewDidAppear(animated)\n        startSession()",
+        "    public override func viewDidAppear(_ animated: Bool) {\n        super.viewDidAppear(animated)\n        uydoshApplyButtonTitles()\n        startSession()"
+      )
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Capture device compass + AR world axes when RoomPlan scan finishes so the floor
+  # plan overlay can show true geographic north (not just scan-relative axes).
+  # Source file is synced earlier via ensure_roomplan_orientation_capture!.
+  if File.exist?(room_capture_file)
+    ensure_roomplan_orientation_capture!
+
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: scan orientation capture */'
+    unless src.include?(marker)
+      src = src.sub('import ARKit', "import ARKit\nimport CoreLocation") unless src.include?('import CoreLocation')
+      src = src.sub(
+        '    public var uydoshScanOtherRoomsTitle: String?',
+        "    public var uydoshScanOtherRoomsTitle: String?\n\n    #{marker}\n    private var uydoshHeadingReader = RoomScanHeadingReader()\n    private var uydoshPendingOrientation: RoomScanOrientationCapture.Snapshot?"
+      )
+
+      unless src.include?("uydoshApplyButtonTitles()\n        uydoshStartHeadingUpdates()") ||
+             src.include?("super.viewDidAppear(animated)\n        uydoshStartHeadingUpdates()")
+        if src.include?("uydoshApplyButtonTitles()\n        startSession()")
+          src = src.sub(
+            "uydoshApplyButtonTitles()\n        startSession()",
+            "uydoshApplyButtonTitles()\n        uydoshStartHeadingUpdates()\n        startSession()"
+          )
+        else
+          src = src.sub(
+            "        super.viewDidAppear(animated)\n        startSession()",
+            "        super.viewDidAppear(animated)\n        uydoshStartHeadingUpdates()\n        startSession()"
+          )
+        end
+      end
+
+      helper = [
+        '',
+        "    #{marker}",
+        '    private func uydoshStartHeadingUpdates() {',
+        '        /* uydosh: live compass heading feed */',
+        '        uydoshHeadingReader.onHeadingUpdate = { [weak self] heading, accuracy in',
+        '            self?.uydoshLiveDetectionOverlay?.updateHeading(',
+        '                degrees: heading,',
+        '                accuracyDegrees: accuracy',
+        '            )',
+        '        }',
+        '        uydoshHeadingReader.start()',
+        '    }',
+        '',
+        '    private func uydoshCaptureScanOrientation() {',
+        '        /* uydosh: filtered heading for orientation */',
+        '        guard let heading = uydoshHeadingReader.bestTrueHeadingDegrees',
+        '            ?? uydoshHeadingReader.trueHeadingDegrees else { return }',
+        '        uydoshPendingOrientation = RoomScanOrientationCapture.snapshot(',
+        '            from: roomCaptureView.captureSession.arSession,',
+        '            trueHeadingDegrees: heading',
+        '        )',
+        '    }',
+        '',
+        '    private func uydoshWriteOrientationSidecarIfNeeded() {',
+        '        guard let snapshot = uydoshPendingOrientation,',
+        '            let path = usdzFilePath else { return }',
+        '        RoomScanOrientationCapture.writeSidecar(snapshot, forUsdzPath: path)',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    private func resetScanningSession() {',
+        "#{helper}\n    private func resetScanningSession() {"
+      )
+
+      src = src.sub(
+        "    public override func viewWillDisappear(_ animated: Bool) {\n        super.viewWillDisappear(animated)\n        stopSession()\n    }",
+        "    public override func viewWillDisappear(_ animated: Bool) {\n        super.viewWillDisappear(animated)\n        uydoshHeadingReader.stop()\n        stopSession()\n    }"
+      )
+
+      src = src.sub(
+        "    @objc private func doneScanning() {\n        if isScanning {",
+        "    @objc private func doneScanning() {\n        uydoshCaptureScanOrientation()\n        if isScanning {"
+      )
+
+      src = src.gsub(
+        "                self.usdzFilePath = fileURL.path\n                \n                print(\"Successfully exported USDZ file to:",
+        "                self.usdzFilePath = fileURL.path\n                self.uydoshWriteOrientationSidecarIfNeeded()\n                \n                print(\"Successfully exported USDZ file to:"
+      )
+
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Long RoomPlan scans exceed the system auto-lock; keep the screen on while capture UI is visible.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: keep screen awake during scan */'
+    unless src.include?(marker)
+      helper = [
+        '',
+        "    #{marker}",
+        '    private var uydoshWasIdleTimerDisabled = false',
+        '',
+        '    private func uydoshKeepScreenAwakeDuringScan() {',
+        '        uydoshWasIdleTimerDisabled = UIApplication.shared.isIdleTimerDisabled',
+        '        UIApplication.shared.isIdleTimerDisabled = true',
+        '    }',
+        '',
+        '    private func uydoshRestoreScreenIdleTimer() {',
+        '        UIApplication.shared.isIdleTimerDisabled = uydoshWasIdleTimerDisabled',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    public override func viewDidAppear(_ animated: Bool) {',
+        "#{helper}\n    public override func viewDidAppear(_ animated: Bool) {"
+      )
+
+      if src.include?("super.viewDidAppear(animated)\n        uydoshApplyButtonTitles()")
+        src = src.sub(
+          "super.viewDidAppear(animated)\n        uydoshApplyButtonTitles()",
+          "super.viewDidAppear(animated)\n        uydoshKeepScreenAwakeDuringScan()\n        uydoshApplyButtonTitles()"
+        )
+      else
+        src = src.sub(
+          "super.viewDidAppear(animated)\n        startSession()",
+          "super.viewDidAppear(animated)\n        uydoshKeepScreenAwakeDuringScan()\n        startSession()"
+        )
+      end
+
+      if src.include?("super.viewWillDisappear(animated)\n        uydoshHeadingReader.stop()")
+        src = src.sub(
+          "super.viewWillDisappear(animated)\n        uydoshHeadingReader.stop()",
+          "super.viewWillDisappear(animated)\n        uydoshRestoreScreenIdleTimer()\n        uydoshHeadingReader.stop()"
+        )
+      else
+        src = src.sub(
+          "super.viewWillDisappear(animated)\n        stopSession()",
+          "super.viewWillDisappear(animated)\n        uydoshRestoreScreenIdleTimer()\n        stopSession()"
+        )
+      end
+
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Stop CoreMotion heading as soon as we have the snapshot (and on every
+  # Flutter-notify / dismiss path). Leaving heading updates running while
+  # RoomPlan tears down the ARSession races MotionThread → EXC_BAD_ACCESS.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: stop heading before ar teardown */'
+    unless src.include?(marker)
+      src = src.sub(
+        "    @objc private func doneScanning() {\n        uydoshCaptureScanOrientation()\n        if isScanning {",
+        "    @objc private func doneScanning() {\n        uydoshCaptureScanOrientation()\n        #{marker}\n        uydoshHeadingReader.stop()\n        if isScanning {"
+      )
+      # Cancel / empty-finish / successful-finish all notify Flutter first —
+      # stop heading there so every exit path is covered.
+      src = src.sub(
+        '    private func uydoshNotifyRoomCaptureFinishedToFlutter() {',
+        "    private func uydoshNotifyRoomCaptureFinishedToFlutter() {\n        #{marker}\n        uydoshHeadingReader.stop()"
+      )
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Makon 3D: disable CLLocation heading entirely during RoomPlan.
+  # Even with early stop(), CoreMotion.MotionThread EXC_BAD_ACCESS still
+  # fires on some devices when heading overlaps ARKit teardown. True-north
+  # on the floor plan is optional for v1 — scan-relative north is enough.
+  # The live compass HUD still mounts; without heading updates it stays idle.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* makon3d: disable heading capture */'
+    unless src.include?(marker)
+      # Match both the legacy start() body and the live-compass-wired body.
+      [
+        [
+          "    private func uydoshStartHeadingUpdates() {\n        uydoshHeadingReader.start()\n    }",
+          "    private func uydoshStartHeadingUpdates() {\n        #{marker}\n        // no-op: avoid CoreMotion race with RoomPlan teardown\n    }",
+        ],
+        [
+          [
+            '    private func uydoshStartHeadingUpdates() {',
+            '        /* uydosh: live compass heading feed */',
+            '        uydoshHeadingReader.onHeadingUpdate = { [weak self] heading, accuracy in',
+            '            self?.uydoshLiveDetectionOverlay?.updateHeading(',
+            '                degrees: heading,',
+            '                accuracyDegrees: accuracy',
+            '            )',
+            '        }',
+            '        uydoshHeadingReader.start()',
+            '    }',
+          ].join("\n"),
+          "    private func uydoshStartHeadingUpdates() {\n        #{marker}\n        // no-op: avoid CoreMotion race with RoomPlan teardown\n    }",
+        ],
+      ].each do |old_body, new_body|
+        if src.include?(old_body)
+          src = src.sub(old_body, new_body)
+          break
+        end
+      end
+      File.write(room_capture_file, src) if src.include?(marker)
+    end
+  end
+
+  # Feed live compass HUD + use filtered heading for the orientation sidecar
+  # (UyDosh and any Makon build that re-enables heading). Skip when Makon
+  # has replaced start() with the disable-heading no-op.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    upgraded = false
+
+    unless src.include?('/* uydosh: live compass heading feed */') ||
+           src.include?('/* makon3d: disable heading capture */')
+      old_start = [
+        '    private func uydoshStartHeadingUpdates() {',
+        '        uydoshHeadingReader.start()',
+        '    }',
+      ].join("\n")
+      new_start = [
+        '    private func uydoshStartHeadingUpdates() {',
+        '        /* uydosh: live compass heading feed */',
+        '        uydoshHeadingReader.onHeadingUpdate = { [weak self] heading, accuracy in',
+        '            self?.uydoshLiveDetectionOverlay?.updateHeading(',
+        '                degrees: heading,',
+        '                accuracyDegrees: accuracy',
+        '            )',
+        '        }',
+        '        uydoshHeadingReader.start()',
+        '    }',
+      ].join("\n")
+      if src.include?(old_start)
+        src = src.sub(old_start, new_start)
+        upgraded = true
+      end
+    end
+
+    unless src.include?('/* uydosh: filtered heading for orientation */')
+      old_capture = [
+        '    private func uydoshCaptureScanOrientation() {',
+        '        guard let heading = uydoshHeadingReader.trueHeadingDegrees else { return }',
+        '        uydoshPendingOrientation = RoomScanOrientationCapture.snapshot(',
+        '            from: roomCaptureView.captureSession.arSession,',
+        '            trueHeadingDegrees: heading',
+        '        )',
+        '    }',
+      ].join("\n")
+      new_capture = [
+        '    private func uydoshCaptureScanOrientation() {',
+        '        /* uydosh: filtered heading for orientation */',
+        '        guard let heading = uydoshHeadingReader.bestTrueHeadingDegrees',
+        '            ?? uydoshHeadingReader.trueHeadingDegrees else { return }',
+        '        uydoshPendingOrientation = RoomScanOrientationCapture.snapshot(',
+        '            from: roomCaptureView.captureSession.arSession,',
+        '            trueHeadingDegrees: heading',
+        '        )',
+        '    }',
+      ].join("\n")
+      if src.include?(old_capture)
+        src = src.sub(old_capture, new_capture)
+        upgraded = true
+      end
+    end
+
+    File.write(room_capture_file, src) if upgraded
+  end
+
+  # Capture synchronized RGB/depth/pose keyframes without taking ownership of
+  # RoomPlan's ARSession. The host receives the completed ZIP URL and decides
+  # when/how to upload it.
+  if File.exist?(room_capture_file)
+    ensure_roomplan_photogrammetry_capture!
+
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: photogrammetry capture phase 1 */'
+    unless src.include?(marker)
+      src = src.sub(
+        '    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?',
+        [
+          '    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?',
+          '',
+          "    #{marker}",
+          '    public var uydoshPhotogrammetryPackageReady: ((URL) -> Void)?',
+          '    public var uydoshPhotogrammetryEnabled = false',
+          '    private let uydoshPhotogrammetryCapture = PhotogrammetryCaptureSession()',
+        ].join("\n")
+      )
+      src = src.sub(
+        '        roomCaptureView.captureSession.run(configuration: roomCaptureSessionConfig)',
+        [
+          '        roomCaptureView.captureSession.run(configuration: roomCaptureSessionConfig)',
+          '        try? uydoshPhotogrammetryCapture.start(',
+          '            arSession: roomCaptureView.captureSession.arSession',
+          '        )',
+        ].join("\n")
+      )
+      src = src.sub(
+        "    private func stopSession() {\n        isScanning = false",
+        [
+          '    private func stopSession() {',
+          '        isScanning = false',
+          '        uydoshPhotogrammetryCapture.stopCapturingFrames()',
+        ].join("\n")
+      )
+      src = src.sub(
+        '    public func captureView(didPresent processedResult: CapturedRoom, error: Error?) {',
+        [
+          '    public func captureView(didPresent processedResult: CapturedRoom, error: Error?) {',
+          '        uydoshQualityHeatmap?.stop()',
+          '        Task { [weak self] in',
+          '            guard let self else { return }',
+          '            guard self.uydoshPhotogrammetryEnabled else { return }',
+          '            do {',
+          '                let package = try await self.uydoshPhotogrammetryCapture.finish(room: processedResult)',
+          '                self.uydoshPhotogrammetryPackageReady?(package.archiveURL)',
+          '                if let root = self.view.window?.rootViewController,',
+          '                   let flutter = Self.uydoshFindFlutterViewController(in: root) {',
+          '                    FlutterMethodChannel(',
+          '                        name: "room_scan_kit/photogrammetry",',
+          '                        binaryMessenger: flutter.binaryMessenger',
+          '                    ).invokeMethod("onPackageReady", arguments: package.archiveURL.path)',
+          '                }',
+          '            } catch {',
+          '                print("[Photogrammetry] native package FAILED: \(error)")',
+          '                if let root = self.view.window?.rootViewController,',
+          '                   let flutter = Self.uydoshFindFlutterViewController(in: root) {',
+          '                    FlutterMethodChannel(',
+          '                        name: "room_scan_kit/photogrammetry",',
+          '                        binaryMessenger: flutter.binaryMessenger',
+          '                    ).invokeMethod("onPackageFailed", arguments: String(describing: error))',
+          '                }',
+          '            }',
+          '        }',
+        ].join("\n")
+      )
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Pass the pre-scan photogrammetry toggle into the capture controller and
+  # keep already-patched flutter_roomplan installations upgrade-safe.
+  if File.exist?(flutter_roomplan_plugin_file)
+    src = File.read(flutter_roomplan_plugin_file)
+    marker = '/* uydosh: photogrammetry enabled argument */'
+    unless src.include?(marker)
+      src = src.sub(
+        '        let roomVC = RoomCaptureViewController()',
+        "        let roomVC = RoomCaptureViewController()\n        #{marker}\n        roomVC.uydoshPhotogrammetryEnabled = arguments?[\"enablePhotogrammetry\"] as? Bool ?? false"
+      )
+    end
+    src = src.sub(
+      'roomVC.uydoshPhotogrammetryEnabled = arguments?["enablePhotogrammetry"] as? Bool ?? true',
+      'roomVC.uydoshPhotogrammetryEnabled = arguments?["enablePhotogrammetry"] as? Bool ?? false'
+    )
+    unless src.include?('/* uydosh: persistent completed scan path */')
+      src = src.sub(
+        '        let roomVC = RoomCaptureViewController()',
+        "        /* uydosh: persistent completed scan path */\n        UserDefaults.standard.removeObject(forKey: \"uydosh.lastRoomPlanUsdzPath\")\n        let roomVC = RoomCaptureViewController()"
+      )
+      src = src.sub(
+        '        result(FlutterError(code: "NO_SCAN", message: "No active room scan found", details: nil))',
+        "        if let path = UserDefaults.standard.string(forKey: \"uydosh.lastRoomPlanUsdzPath\") {\n          result(path)\n        } else {\n          result(FlutterError(code: \"NO_SCAN\", message: \"No completed room scan found\", details: nil))\n        }"
+      )
+    end
+    File.write(flutter_roomplan_plugin_file, src)
+  end
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    src = src.sub(
+      '            if let package = try? await self.uydoshPhotogrammetryCapture.finish(room: processedResult) {',
+      "            do {\n                let package = try await self.uydoshPhotogrammetryCapture.finish(room: processedResult)"
+    )
+    unless src.include?('invokeMethod("onPackageFailed"')
+      src = src.sub(
+        "                }\n            }\n        }\n        currentCapturedRoom = processedResult",
+        "                }\n            } catch {\n                print(\"[Photogrammetry] native package FAILED: \\(error)\")\n                if let root = self.view.window?.rootViewController,\n                   let flutter = Self.uydoshFindFlutterViewController(in: root) {\n                    FlutterMethodChannel(\n                        name: \"room_scan_kit/photogrammetry\",\n                        binaryMessenger: flutter.binaryMessenger\n                    ).invokeMethod(\"onPackageFailed\", arguments: String(describing: error))\n                }\n            }\n        }\n        currentCapturedRoom = processedResult"
+      )
+    end
+    if src.include?('public var uydoshPhotogrammetryEnabled = true')
+      src = src.sub('public var uydoshPhotogrammetryEnabled = true', 'public var uydoshPhotogrammetryEnabled = false')
+    elsif !src.include?('public var uydoshPhotogrammetryEnabled = false')
+      src = src.sub(
+        '    public var uydoshPhotogrammetryPackageReady: ((URL) -> Void)?',
+        "    public var uydoshPhotogrammetryPackageReady: ((URL) -> Void)?\n    public var uydoshPhotogrammetryEnabled = false"
+      )
+    end
+    unless src.include?('guard self.uydoshPhotogrammetryEnabled else { return }')
+      src = src.sub(
+        '            guard let self else { return }',
+        "            guard let self else { return }\n            guard self.uydoshPhotogrammetryEnabled else { return }"
+      )
+    end
+    unless src.include?('public var uydoshPhotogrammetryPackageFailed: ((Error) -> Void)?')
+      src = src.sub(
+        '    public var uydoshPhotogrammetryPackageReady: ((URL) -> Void)?',
+        "    public var uydoshPhotogrammetryPackageReady: ((URL) -> Void)?\n    public var uydoshPhotogrammetryPackageFailed: ((Error) -> Void)?"
+      )
+    end
+    ready_channel = <<~SWIFT.chomp
+                if let root = self.view.window?.rootViewController,
+                   let flutter = Self.uydoshFindFlutterViewController(in: root) {
+                    FlutterMethodChannel(
+                        name: "room_scan_kit/photogrammetry",
+                        binaryMessenger: flutter.binaryMessenger
+                    ).invokeMethod("onPackageReady", arguments: package.archiveURL.path)
+                }
+    SWIFT
+    src = src.sub(ready_channel, '')
+    failed_channel = <<~SWIFT.chomp
+                if let root = self.view.window?.rootViewController,
+                   let flutter = Self.uydoshFindFlutterViewController(in: root) {
+                    FlutterMethodChannel(
+                        name: "room_scan_kit/photogrammetry",
+                        binaryMessenger: flutter.binaryMessenger
+                    ).invokeMethod("onPackageFailed", arguments: String(describing: error))
+                }
+    SWIFT
+    src = src.sub(
+      failed_channel,
+      '                self.uydoshPhotogrammetryPackageFailed?(error)'
+    )
+    src = src.gsub(
+      /\n\s*if let root = self\.view\.window\?\.rootViewController,\n\s*let flutter = Self\.uydoshFindFlutterViewController\(in: root\) \{\n\s*FlutterMethodChannel\(\n\s*name: "room_scan_kit\/photogrammetry",\n\s*binaryMessenger: flutter\.binaryMessenger\n\s*\)\.invokeMethod\("onPackageReady", arguments: package\.archiveURL\.path\)\n\s*\}/,
+      ''
+    )
+    src = src.gsub(
+      /\n\s*if let root = self\.view\.window\?\.rootViewController,\n\s*let flutter = Self\.uydoshFindFlutterViewController\(in: root\) \{\n\s*FlutterMethodChannel\(\n\s*name: "room_scan_kit\/photogrammetry",\n\s*binaryMessenger: flutter\.binaryMessenger\n\s*\)\.invokeMethod\("onPackageFailed", arguments: String\(describing: error\)\)\n\s*\}/,
+      "\n                self.uydoshPhotogrammetryPackageFailed?(error)"
+    )
+    old_start = "        try? uydoshPhotogrammetryCapture.start(\n            arSession: roomCaptureView.captureSession.arSession\n        )"
+    unless src.include?("        if uydoshPhotogrammetryEnabled {\n#{old_start}")
+      src = src.sub(old_start, "        if uydoshPhotogrammetryEnabled {\n#{old_start}\n        }")
+    end
+    unless src.include?('UserDefaults.standard.set(fileURL.path, forKey: "uydosh.lastRoomPlanUsdzPath")')
+      src = src.gsub(
+        '                self.usdzFilePath = fileURL.path',
+        "                self.usdzFilePath = fileURL.path\n                UserDefaults.standard.set(fileURL.path, forKey: \"uydosh.lastRoomPlanUsdzPath\")"
+      )
+    end
+    File.write(room_capture_file, src)
+  end
+
+  # Capture the Flutter channel while the Flutter view is still attached.
+  # ZIP creation can finish after RoomPlan is dismissed, when view.window is nil.
+  if File.exist?(flutter_roomplan_plugin_file)
+    src = File.read(flutter_roomplan_plugin_file)
+    unless src.include?('private var uydoshPhotogrammetryChannel: FlutterMethodChannel?')
+      src = src.sub(
+        'public class FlutterRoomplanPlugin: NSObject, FlutterPlugin {',
+        "public class FlutterRoomplanPlugin: NSObject, FlutterPlugin {\n  private var uydoshPhotogrammetryChannel: FlutterMethodChannel?"
+      )
+      src = src.sub(
+        '    let instance = FlutterRoomplanPlugin()',
+        "    let instance = FlutterRoomplanPlugin()\n    instance.uydoshPhotogrammetryChannel = FlutterMethodChannel(name: \"room_scan_kit/photogrammetry\", binaryMessenger: registrar.messenger())"
+      )
+    end
+    marker = '/* uydosh: persistent photogrammetry channel */'
+    unless src.include?(marker)
+      assignment = '        roomVC.uydoshPhotogrammetryEnabled = arguments?["enablePhotogrammetry"] as? Bool ?? false'
+      callback_setup = [
+        assignment,
+        "        #{marker}",
+        '        if let photogrammetryChannel = self.uydoshPhotogrammetryChannel {',
+        '          roomVC.uydoshPhotogrammetryPackageReady = { archiveURL in',
+        '            DispatchQueue.main.async {',
+        '              photogrammetryChannel.invokeMethod("onPackageReady", arguments: archiveURL.path)',
+        '            }',
+        '          }',
+        '          roomVC.uydoshPhotogrammetryPackageFailed = { error in',
+        '            DispatchQueue.main.async {',
+        '              photogrammetryChannel.invokeMethod("onPackageFailed", arguments: String(describing: error))',
+        '            }',
+        '          }',
+        '        }',
+      ].join("\n")
+      src = src.sub(assignment, callback_setup)
+    end
+    src = src.gsub(
+      /if let flutter = FlutterRoomplanPlugin\.uydoshFindFlutterViewController\(in: rootVC\) \{\n\s*let photogrammetryChannel = FlutterMethodChannel\(\n\s*name: "room_scan_kit\/photogrammetry",\n\s*binaryMessenger: flutter\.binaryMessenger\n\s*\)/,
+      'if let photogrammetryChannel = self.uydoshPhotogrammetryChannel {'
+    )
+    File.write(flutter_roomplan_plugin_file, src)
+  end
+
+  # Ensure the live heatmap cannot leak into RoomPlan's processed-result view,
+  # including upgrades where the Phase 1 marker already exists.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    needle = "    public func captureView(didPresent processedResult: CapturedRoom, error: Error?) {\n"
+    unless src.include?("#{needle}        uydoshQualityHeatmap?.stop()\n")
+      src = src.sub(needle, "#{needle}        uydoshQualityHeatmap?.stop()\n")
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Live detection feed + stats HUD during RoomPlan capture.
+  # Source: room_scan_kit RoomScanLiveDetectionOverlay.swift (synced above).
+  if File.exist?(room_capture_file)
+    ensure_roomplan_live_detection_overlay!
+
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: live detection overlay */'
+    unless src.include?(marker)
+      src = src.sub(
+        '    public var uydoshScanOtherRoomsTitle: String?',
+        "    public var uydoshScanOtherRoomsTitle: String?\n\n    #{marker}\n    public var uydoshLiveDetectionStringOverrides: [String: String]?\n    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?"
+      )
+
+      if src.include?("uydoshAddLogoOverlay()\n        activityIndicator.stopAnimating()")
+        src = src.sub(
+          "uydoshAddLogoOverlay()\n        activityIndicator.stopAnimating()",
+          "uydoshAddLogoOverlay()\n        uydoshAddLiveDetectionOverlay()\n        activityIndicator.stopAnimating()"
+        )
+      elsif src.include?("setupRoomCaptureView()\n        activityIndicator.stopAnimating()")
+        src = src.sub(
+          "setupRoomCaptureView()\n        activityIndicator.stopAnimating()",
+          "setupRoomCaptureView()\n        uydoshAddLiveDetectionOverlay()\n        activityIndicator.stopAnimating()"
+        )
+      end
+
+      src = src.sub(
+        "    private func startSession() {\n\n        isScanning = true\n        roomCaptureView.captureSession.run(configuration: roomCaptureSessionConfig)",
+        "    private func startSession() {\n\n        isScanning = true\n        uydoshLiveDetectionOverlay?.reset()\n        uydoshLiveDetectionOverlay?.setScanningActive(true, animated: true)\n        roomCaptureView.captureSession.run(configuration: roomCaptureSessionConfig)"
+      )
+
+      src = src.sub(
+        "    private func stopSession() {\n        isScanning = false",
+        "    private func stopSession() {\n        isScanning = false\n        uydoshLiveDetectionOverlay?.setScanningActive(false, animated: true)"
+      )
+
+      unless src.include?('func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom)')
+        src = src.sub(
+          "    public func captureView(shouldPresent roomDataForProcessing: CapturedRoomData, error: Error?) -> Bool {\n        return true\n    }",
+          [
+            '    public func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {',
+            '        /* uydosh: quality heatmap RoomPlan fallback */',
+            '        uydoshQualityHeatmap?.process(room: room)',
+            '        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: true)',
+            '    }',
+            '',
+            '    /* uydosh: live detection didAdd/didChange */',
+            '    public func captureSession(_ session: RoomCaptureSession, didAdd room: CapturedRoom) {',
+            '        uydoshQualityHeatmap?.process(room: room)',
+            '        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: false)',
+            '    }',
+            '',
+            '    public func captureSession(_ session: RoomCaptureSession, didChange room: CapturedRoom) {',
+            '        uydoshQualityHeatmap?.process(room: room)',
+            '        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: false)',
+            '    }',
+            '',
+            '    public func captureView(shouldPresent roomDataForProcessing: CapturedRoomData, error: Error?) -> Bool {',
+            '        return true',
+            '    }',
+          ].join("\n")
+        )
+      end
+
+      helper = [
+        '',
+        "    #{marker}",
+        '    private func uydoshAddLiveDetectionOverlay() {',
+        '        let overlay = RoomScanLiveDetectionOverlay(',
+        '            strings: .localized(overrides: uydoshLiveDetectionStringOverrides ?? [:])',
+        '        )',
+        '        overlay.attach(to: view)',
+        '        overlay.setScanningActive(false, animated: false)',
+        '        uydoshLiveDetectionOverlay = overlay',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    private func resetScanningSession() {',
+        "#{helper}\n    private func resetScanningSession() {"
+      )
+
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Upgrade installs that only wired didUpdate: also toast from didAdd / didChange.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: live detection didAdd/didChange */'
+    unless src.include?(marker)
+      old = "    public func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {\n        uydoshLiveDetectionOverlay?.process(room: room)\n    }"
+      oldWithStats = "    public func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {\n        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: true)\n    }"
+      replacement = [
+        '    public func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {',
+        '        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: true)',
+        '    }',
+        '',
+        "    #{marker}",
+        '    public func captureSession(_ session: RoomCaptureSession, didAdd room: CapturedRoom) {',
+        '        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: false)',
+        '    }',
+        '',
+        '    public func captureSession(_ session: RoomCaptureSession, didChange room: CapturedRoom) {',
+        '        // Category / transform refinements (e.g. box → television).',
+        '        uydoshLiveDetectionOverlay?.process(room: room, replaceStats: false)',
+        '    }',
+      ].join("\n")
+      if src.include?(old)
+        src = src.sub(old, replacement)
+        File.write(room_capture_file, src)
+      elsif src.include?(oldWithStats)
+        src = src.sub(oldWithStats, replacement)
+        File.write(room_capture_file, src)
+      end
+    end
+  end
+
+  # Real-time scan quality heatmap. This is a transparent renderer over the
+  # RoomCaptureView; RoomPlan keeps ownership of ARSession and its semantic
+  # wall/object/door/window outlines remain enabled.
+  if File.exist?(room_capture_file)
+    ensure_roomplan_quality_heatmap!
+
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: scan quality heatmap */'
+    unless src.include?(marker)
+      src = src.sub(
+        '    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?',
+        "    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?\n\n    #{marker}\n    private var uydoshQualityHeatmap: RoomScanQualityHeatmap?"
+      )
+
+      src = src.sub(
+        "        setupRoomCaptureView()\n",
+        "        setupRoomCaptureView()\n        uydoshAddQualityHeatmap()\n"
+      )
+
+      src = src.sub(
+        '        roomCaptureView.captureSession.run(configuration: roomCaptureSessionConfig)',
+        [
+          '        uydoshQualityHeatmap?.reset()',
+          '        roomCaptureView.captureSession.run(configuration: roomCaptureSessionConfig)',
+          '        uydoshQualityHeatmap?.start(session: roomCaptureView.captureSession.arSession)',
+        ].join("\n")
+      )
+
+      src = src.sub(
+        "    private func stopSession() {\n        isScanning = false",
+        "    private func stopSession() {\n        isScanning = false\n        uydoshQualityHeatmap?.stop()"
+      )
+
+      helper = [
+        '',
+        "    #{marker}",
+        '    private func uydoshAddQualityHeatmap() {',
+        '        let heatmap = RoomScanQualityHeatmap(',
+        '            stringOverrides: uydoshLiveDetectionStringOverrides ?? [:]',
+        '        )',
+        '        heatmap.attach(to: roomCaptureView)',
+        '        uydoshQualityHeatmap = heatmap',
+        '    }',
+      ].join("\n")
+      src = src.sub(
+        '    private func resetScanningSession() {',
+        "#{helper}\n    private func resetScanningSession() {"
+      )
+
+      File.write(room_capture_file, src)
+    end
+
+    # Upgrade-safe: pass Flutter startScan strings into the quality overlay HUD.
+    src = File.read(room_capture_file)
+    old_heatmap_init = "        let heatmap = RoomScanQualityHeatmap()\n        heatmap.attach(to: roomCaptureView)"
+    new_heatmap_init = [
+      '        let heatmap = RoomScanQualityHeatmap(',
+      '            stringOverrides: uydoshLiveDetectionStringOverrides ?? [:]',
+      '        )',
+      '        heatmap.attach(to: roomCaptureView)',
+    ].join("\n")
+    if src.include?(old_heatmap_init)
+      src = src.sub(old_heatmap_init, new_heatmap_init)
+      File.write(room_capture_file, src)
+    end
+  end
+
+
+  # Repair clean-CI / upgrade installs where heatmap usages were patched in but the
+  # property declaration was skipped (old Podfile applied heatmap before live detection).
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    if src.include?('uydoshQualityHeatmap') && !src.include?('private var uydoshQualityHeatmap:')
+      ensure_roomplan_quality_heatmap!
+      inserted = false
+      if src.include?('    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?')
+        src = src.sub(
+          '    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?',
+          "    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?\n\n    /* uydosh: scan quality heatmap */\n    private var uydoshQualityHeatmap: RoomScanQualityHeatmap?"
+        )
+        inserted = true
+      elsif src.include?('    public var uydoshScanOtherRoomsTitle: String?')
+        src = src.sub(
+          '    public var uydoshScanOtherRoomsTitle: String?',
+          "    public var uydoshScanOtherRoomsTitle: String?\n\n    /* uydosh: scan quality heatmap */\n    private var uydoshQualityHeatmap: RoomScanQualityHeatmap?"
+        )
+        inserted = true
+      end
+      File.write(room_capture_file, src) if inserted
+      Pod::UI.puts 'Repaired missing uydoshQualityHeatmap property in RoomCaptureViewController' if inserted
+    end
+  end
+
+  # Feed live RoomPlan geometry to the quality renderer. RoomCaptureView often
+  # exposes no ARMeshAnchor even on LiDAR hardware, so this semantic fallback
+  # prevents an empty heatmap and permanent 0% progress.
+  if File.exist?(room_capture_file)
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: quality heatmap RoomPlan fallback */'
+    unless src.include?(marker)
+      src = src.gsub(
+        /^(\s*public func captureSession\(_ session: RoomCaptureSession, did(?:Update|Add|Change) room: CapturedRoom\) \{\n)/,
+        "\\1        #{marker}\n        uydoshQualityHeatmap?.process(room: room)\n"
+      )
+      File.write(room_capture_file, src)
+    end
+  end
+
+  # Post-scan results metrics card (perimeter / area / walls / windows / doors)
+  # shown once RoomPlan presents the grey processed model.
+  if File.exist?(room_capture_file)
+    ensure_roomplan_results_overlay!
+
+    src = File.read(room_capture_file)
+    marker = '/* uydosh: results overlay */'
+    unless src.include?(marker)
+      src = src.sub(
+        '    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?',
+        "    private var uydoshLiveDetectionOverlay: RoomScanLiveDetectionOverlay?\n\n    #{marker}\n    private var uydoshResultsOverlay: RoomScanResultsOverlay?"
+      )
+
+      src = src.sub(
+        'uydoshAddLiveDetectionOverlay()',
+        "uydoshAddLiveDetectionOverlay()\n        uydoshAddResultsOverlay()"
+      )
+
+      src = src.sub(
+        '        uydoshLiveDetectionOverlay?.setScanningActive(true, animated: true)',
+        "        uydoshLiveDetectionOverlay?.setScanningActive(true, animated: true)\n        uydoshResultsOverlay?.hide(animated: true)"
+      )
+
+      src = src.sub(
+        "    public func captureView(didPresent processedResult: CapturedRoom, error: Error?) {\n        currentCapturedRoom = processedResult\n        capturedRoomArray.append(processedResult)\n        finishButton.isEnabled = true",
+        "    public func captureView(didPresent processedResult: CapturedRoom, error: Error?) {\n        currentCapturedRoom = processedResult\n        capturedRoomArray.append(processedResult)\n        finishButton.isEnabled = true\n        uydoshResultsOverlay?.show(room: processedResult, animated: true)"
+      )
+
+      helper = [
+        '',
+        "    #{marker}",
+        '    private func uydoshAddResultsOverlay() {',
+        '        let overlay = RoomScanResultsOverlay(',
+        '            strings: .localized(overrides: uydoshLiveDetectionStringOverrides ?? [:])',
+        '        )',
+        '        overlay.attach(to: view)',
+        '        uydoshResultsOverlay = overlay',
+        '    }',
+      ].join("\n")
+
+      src = src.sub(
+        '    private func resetScanningSession() {',
+        "#{helper}\n    private func resetScanningSession() {"
+      )
+
+      File.write(room_capture_file, src)
+    end
+  end
+end

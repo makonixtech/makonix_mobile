@@ -13,7 +13,7 @@ import "package:makon3d_mobile/services/scans_refresh_notifier.dart";
 import "package:makon3d_mobile/widgets/toasts.dart";
 
 /// Lists all recent public scans (everyone's, for now — same feed as the
-/// Makon3D web gallery).
+/// Makonix web gallery).
 class ScansListScreen extends StatefulWidget {
   const ScansListScreen({super.key, this.isActive = false});
 

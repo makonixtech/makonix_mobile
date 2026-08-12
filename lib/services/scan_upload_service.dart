@@ -116,7 +116,7 @@ class ScanUploadService {
   }
 
   /// All recent public scans across devices — the Scans tab shows everything
-  /// for now (same feed as the Makon3D web gallery / Telegram bot).
+  /// for now (same feed as the Makonix web gallery / Telegram bot).
   static Future<List<MakonScan>> listAllScans({CancelToken? cancelToken}) {
     return _listScans(cancelToken: cancelToken);
   }

@@ -1,5 +1,0 @@
-Photorealistic celestial bodies for the room USDZ viewer (cosmetic orbs; no light/shadow).
-
-- Moon: TurboSquid gerhald3d / "Moon Photorealistic 2K" — mesh + diffuse (~1K, alpha-flattened).
-- Sun: sol pack (bzh92xlorfnk-sol) — Cinema4D sphere mesh + 2k_sun equirectangular map
-  (resized to 1024×512 JPEG). StarsMap from the pack is unused (viewer keeps its own star dome).
